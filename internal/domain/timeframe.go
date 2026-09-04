@@ -10,9 +10,10 @@ import (
 // ErrUnknownTimeframe возвращается ParseTimeframe; проверять через errors.Is.
 var ErrUnknownTimeframe = errors.New("unknown timeframe")
 
-// Timeframe — длина окна агрегации. В MVP поддержаны только 1s и 1m
-// этого достаточно, чтобы показать и «горячее» окно,
-// и окно с редкими сделками.
+// Timeframe — длина окна агрегации: за этот отрезок времени сделки
+// схлопываются в одну OHLCV-свечу. В MVP поддержаны 1s (секунда)
+// и 1m (минута): секундные окна показывают горячий инструмент,
+// минутные — редкие сделки по BTC-USDC.
 type Timeframe string
 
 const (
