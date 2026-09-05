@@ -71,19 +71,26 @@ services:
         TOPICS=/opt/kafka/bin/kafka-topics.sh
         BOOTSTRAP=kafka:19092
 
-        # 3 партиции по числу инструментов: ключ партиционирования — символ,
-        # больше партиций дадут пустые, меньше — потерю параллелизма.
+        # 4 партиции при трёх инструментах — число подобрано замером, а не
+        # рассуждением. Ключ партиционирования это символ, и напрашивалось
+        # взять партиций по числу инструментов. Но Kafka раскладывает ключи
+        # по murmur2, и на трёх партициях все три наших символа дают один и
+        # тот же остаток: весь поток уходит в одну партицию, две пустуют.
+        # На четырёх каждый символ получает свою, четвёртая остаётся пустой.
+        # Урок общий: хеш не даёт равномерности на малом числе ключей,
+        # поэтому партиций берут с запасом и распределение проверяют.
+        #
         # retention 24 часа: поток восстановимо перечитывается с биржи,
         # хранить сделки дольше в учебном стенде незачем.
         "$$TOPICS" --bootstrap-server "$$BOOTSTRAP" --create --if-not-exists \
-          --topic md.trades --partitions 3 --replication-factor 1 \
+          --topic md.trades --partitions 4 --replication-factor 1 \
           --config retention.ms=86400000
 
         # cleanup.policy=compact: ключ свечи — <symbol>|<timeframe>, поэтому
         # компакция оставляет последнюю версию каждой свечи и топик
         # работает как снимок текущего состояния, а не как журнал.
         "$$TOPICS" --bootstrap-server "$$BOOTSTRAP" --create --if-not-exists \
-          --topic md.candles --partitions 3 --replication-factor 1 \
+          --topic md.candles --partitions 4 --replication-factor 1 \
           --config cleanup.policy=compact
 
         echo "--- topics ---"

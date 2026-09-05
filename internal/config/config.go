@@ -30,6 +30,12 @@ type Ingestor struct {
 	// Список формирует адаптер биржи из Symbols.
 	BinanceWSURL string
 
+	// KafkaBrokers — адреса брокеров для первичного подключения. Остальные
+	// узлы кластера клиент узнаёт из метаданных сам.
+	KafkaBrokers []string
+
+	TopicTrades string
+
 	LogLevel slog.Level
 }
 
@@ -50,11 +56,48 @@ func LoadIngestor() (Ingestor, error) {
 		return Ingestor{}, fmt.Errorf("%w: MDP_BINANCE_WS_URL is empty", ErrInvalidConfig)
 	}
 
+	brokers, err := parseList(env("MDP_KAFKA_BROKERS", "localhost:9092"))
+	if err != nil {
+		return Ingestor{}, fmt.Errorf("%w: MDP_KAFKA_BROKERS: %w", ErrInvalidConfig, err)
+	}
+
+	topic, err := parseTopic(env("MDP_TOPIC_TRADES", "md.trades"))
+	if err != nil {
+		return Ingestor{}, fmt.Errorf("%w: MDP_TOPIC_TRADES: %w", ErrInvalidConfig, err)
+	}
+
 	return Ingestor{
 		Symbols:      symbols,
 		BinanceWSURL: wsURL,
+		KafkaBrokers: brokers,
+		TopicTrades:  topic,
 		LogLevel:     level,
 	}, nil
+}
+
+// parseList разбирает список значений через запятую, отбрасывая пустые.
+func parseList(raw string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			values = append(values, trimmed)
+		}
+	}
+
+	if len(values) == 0 {
+		return nil, errors.New("list is empty")
+	}
+	return values, nil
+}
+
+func parseTopic(raw string) (string, error) {
+	topic := strings.TrimSpace(raw)
+	if topic == "" {
+		return "", errors.New("topic name is empty")
+	}
+	return topic, nil
 }
 
 // env возвращает значение переменной окружения или значение по умолчанию.
