@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/IronGigas/market-data-pipeline/internal/domain"
 )
@@ -98,6 +99,121 @@ func parseTopic(raw string) (string, error) {
 		return "", errors.New("topic name is empty")
 	}
 	return topic, nil
+}
+
+// Aggregator — настройки сервиса aggregator.
+type Aggregator struct {
+	// Timeframes — таймфреймы, которые считаются параллельно из одного
+	// потока сделок.
+	Timeframes []domain.Timeframe
+
+	KafkaBrokers  []string
+	TopicTrades   string
+	ConsumerGroup string
+
+	// Grace — сколько ждать опоздавшие сделки после границы окна.
+	Grace time.Duration
+
+	// IdleTimeout — добавка к дедлайну для окон замолчавшего инструмента.
+	IdleTimeout time.Duration
+
+	LogLevel slog.Level
+}
+
+// LoadAggregator читает конфигурацию aggregator из окружения.
+//
+// Списка инструментов здесь нет намеренно: агрегатор считает окна по тем
+// символам, которые реально пришли из топика, и знать их заранее ему незачем.
+func LoadAggregator() (Aggregator, error) {
+	timeframes, err := parseTimeframes(env("MDP_TIMEFRAMES", "1s,1m"))
+	if err != nil {
+		return Aggregator{}, err
+	}
+
+	level, err := parseLogLevel(env("MDP_LOG_LEVEL", "info"))
+	if err != nil {
+		return Aggregator{}, err
+	}
+
+	brokers, err := parseList(env("MDP_KAFKA_BROKERS", "localhost:9092"))
+	if err != nil {
+		return Aggregator{}, fmt.Errorf("%w: MDP_KAFKA_BROKERS: %w", ErrInvalidConfig, err)
+	}
+
+	topicTrades, err := parseTopic(env("MDP_TOPIC_TRADES", "md.trades"))
+	if err != nil {
+		return Aggregator{}, fmt.Errorf("%w: MDP_TOPIC_TRADES: %w", ErrInvalidConfig, err)
+	}
+
+	group := strings.TrimSpace(env("MDP_CONSUMER_GROUP", "md-aggregator"))
+	if group == "" {
+		return Aggregator{}, fmt.Errorf("%w: MDP_CONSUMER_GROUP is empty", ErrInvalidConfig)
+	}
+
+	grace, err := parseDuration(env("MDP_GRACE_PERIOD", "2s"))
+	if err != nil {
+		return Aggregator{}, fmt.Errorf("%w: MDP_GRACE_PERIOD: %w", ErrInvalidConfig, err)
+	}
+
+	idleTimeout, err := parseDuration(env("MDP_IDLE_TIMEOUT", "3s"))
+	if err != nil {
+		return Aggregator{}, fmt.Errorf("%w: MDP_IDLE_TIMEOUT: %w", ErrInvalidConfig, err)
+	}
+
+	return Aggregator{
+		Timeframes:    timeframes,
+		KafkaBrokers:  brokers,
+		TopicTrades:   topicTrades,
+		ConsumerGroup: group,
+		Grace:         grace,
+		IdleTimeout:   idleTimeout,
+		LogLevel:      level,
+	}, nil
+}
+
+// parseTimeframes разбирает список таймфреймов через запятую.
+func parseTimeframes(raw string) ([]domain.Timeframe, error) {
+	parts := strings.Split(raw, ",")
+	timeframes := make([]domain.Timeframe, 0, len(parts))
+	seen := make(map[domain.Timeframe]struct{}, len(parts))
+
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+
+		tf, err := domain.ParseTimeframe(part)
+		if err != nil {
+			return nil, fmt.Errorf("%w: MDP_TIMEFRAMES: %w", ErrInvalidConfig, err)
+		}
+		// Дубликат означал бы два одинаковых окна на инструмент и двойную
+		// запись одной и той же свечи.
+		if _, dup := seen[tf]; dup {
+			return nil, fmt.Errorf("%w: MDP_TIMEFRAMES: duplicate timeframe %q", ErrInvalidConfig, tf)
+		}
+
+		seen[tf] = struct{}{}
+		timeframes = append(timeframes, tf)
+	}
+
+	if len(timeframes) == 0 {
+		return nil, fmt.Errorf("%w: MDP_TIMEFRAMES is empty", ErrInvalidConfig)
+	}
+	return timeframes, nil
+}
+
+// parseDuration разбирает длительность в формате time.ParseDuration.
+// Ноль и отрицательные значения отвергаются: они означали бы окно без
+// grace period, что почти наверняка опечатка, а не намерение.
+func parseDuration(raw string) (time.Duration, error) {
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("%q: %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%q: must be positive", raw)
+	}
+	return d, nil
 }
 
 // env возвращает значение переменной окружения или значение по умолчанию.
