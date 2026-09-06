@@ -44,27 +44,3 @@ func TestParseSymbol(t *testing.T) {
 		})
 	}
 }
-
-func TestSymbolBaseQuote(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		in        domain.Symbol
-		wantBase  string
-		wantQuote string
-	}{
-		{name: "BTC-USDT", in: "BTC-USDT", wantBase: "BTC", wantQuote: "USDT"},
-		{name: "BTC-USDC", in: "BTC-USDC", wantBase: "BTC", wantQuote: "USDC"},
-		{name: "невалидный символ даёт пустые части", in: "BTCUSDT"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			require.Equal(t, tc.wantBase, tc.in.Base())
-			require.Equal(t, tc.wantQuote, tc.in.Quote())
-		})
-	}
-}

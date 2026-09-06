@@ -80,14 +80,6 @@ func New(ctx context.Context, cfg Config) (*DB, error) {
 	return &DB{pool: pool, log: cfg.Logger}, nil
 }
 
-// Ping проверяет доступность базы.
-func (db *DB) Ping(ctx context.Context) error {
-	if err := db.pool.Ping(ctx); err != nil {
-		return fmt.Errorf("postgres: ping: %w", err)
-	}
-	return nil
-}
-
 // Close закрывает пул и ждёт завершения активных запросов.
 func (db *DB) Close() {
 	db.pool.Close()

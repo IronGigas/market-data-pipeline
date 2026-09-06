@@ -36,13 +36,22 @@ type Window struct {
 	Volume decimal.Decimal
 
 	TradeCount int64
+
+	// UpdatedAt — момент последнего попадания сделки в окно по часам сервиса,
+	// а не по времени биржи.
+	//
+	// Именно от него отсчитывается простой. Сравнивать дедлайн окна (он в
+	// биржевом времени) с системными часами нельзя: при разборе накопленного
+	// в топике часы уходят вперёд на часы, и любое окно оказывалось бы
+	// «простаивающим» сразу после создания.
+	UpdatedAt time.Time
 }
 
 // newWindow открывает окно первой сделкой.
 //
 // Все четыре цены равны цене этой сделки: окно из одной сделки — это свеча
 // с нулевым размахом, а не свеча с нулевыми high и low.
-func newWindow(key WindowKey, openTime time.Time, trade domain.Trade) *Window {
+func newWindow(key WindowKey, openTime time.Time, trade domain.Trade, now time.Time) *Window {
 	return &Window{
 		Key:        key,
 		OpenTime:   openTime,
@@ -52,6 +61,7 @@ func newWindow(key WindowKey, openTime time.Time, trade domain.Trade) *Window {
 		Close:      trade.Price,
 		Volume:     trade.Quantity,
 		TradeCount: 1,
+		UpdatedAt:  now,
 	}
 }
 
@@ -60,7 +70,7 @@ func newWindow(key WindowKey, openTime time.Time, trade domain.Trade) *Window {
 // Open не трогается никогда: цена открытия окна задана первой сделкой и по
 // определению неизменна. Close перезаписывается каждой сделкой, поэтому в
 // закрытой свече им окажется цена последней.
-func (w *Window) apply(trade domain.Trade) {
+func (w *Window) apply(trade domain.Trade, now time.Time) {
 	if trade.Price.GreaterThan(w.High) {
 		w.High = trade.Price
 	}
@@ -71,6 +81,7 @@ func (w *Window) apply(trade domain.Trade) {
 	w.Close = trade.Price
 	w.Volume = w.Volume.Add(trade.Quantity)
 	w.TradeCount++
+	w.UpdatedAt = now
 }
 
 // CloseTime возвращает границу окна: момент, с которого начинается следующее.

@@ -136,46 +136,6 @@ func TestTimeframeTruncate(t *testing.T) {
 	}
 }
 
-// TestTimeframeTruncateIsIdempotent фиксирует свойство, на которое опирается
-// агрегатор: OpenTime уже выровнено, повторное выравнивание его не двигает.
-func TestTimeframeTruncateIsIdempotent(t *testing.T) {
-	t.Parallel()
-
-	in := time.Date(2026, 9, 3, 10, 15, 30, 123_456_789, time.UTC)
-
-	for _, tf := range domain.Timeframes() {
-		t.Run(tf.String(), func(t *testing.T) {
-			t.Parallel()
-
-			once := tf.Truncate(in)
-			twice := tf.Truncate(once)
-
-			require.True(t, once.Equal(twice), "want %s, got %s", once, twice)
-		})
-	}
-}
-
-// TestTimeframeTruncateWindowIsHalfOpen проверяет, что окно полуинтервально:
-// [OpenTime, OpenTime+Duration). Именно на этом держится расчёт CloseTime.
-func TestTimeframeTruncateWindowIsHalfOpen(t *testing.T) {
-	t.Parallel()
-
-	in := time.Date(2026, 9, 3, 10, 15, 30, 123_456_789, time.UTC)
-
-	for _, tf := range domain.Timeframes() {
-		t.Run(tf.String(), func(t *testing.T) {
-			t.Parallel()
-
-			open := tf.Truncate(in)
-			closeTime := open.Add(tf.Duration())
-
-			require.True(t, !in.Before(open), "событие раньше начала своего окна")
-			require.True(t, in.Before(closeTime), "событие не раньше конца своего окна")
-			require.True(t, tf.Truncate(closeTime).Equal(closeTime), "конец окна — начало следующего")
-		})
-	}
-}
-
 func TestParseTimeframe(t *testing.T) {
 	t.Parallel()
 

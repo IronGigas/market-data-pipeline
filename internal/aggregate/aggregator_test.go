@@ -37,6 +37,13 @@ func newTestAggregator(t *testing.T, timeframes ...domain.Timeframe) *Aggregator
 	return a
 }
 
+// addLive добавляет сделку так, будто часы сервиса совпадают с временем
+// биржи, — это нормальный режим работы. Сценарий разбора накопленного,
+// где шкалы расходятся, проверяется отдельно.
+func addLive(a *Aggregator, tr domain.Trade) {
+	a.Add(tr, tr.EventTime)
+}
+
 // trade собирает сделку по инструменту в заданный момент.
 func trade(symbol domain.Symbol, price, quantity string, eventTime time.Time) domain.Trade {
 	return domain.Trade{
@@ -68,15 +75,15 @@ func TestCloseByWatermark(t *testing.T) {
 
 	a := newTestAggregator(t)
 
-	a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(10*time.Second)))
-	a.Add(trade("BTC-USDT", "110", "2", baseTime.Add(30*time.Second)))
+	addLive(a, trade("BTC-USDT", "100", "1", baseTime.Add(10*time.Second)))
+	addLive(a, trade("BTC-USDT", "110", "2", baseTime.Add(30*time.Second)))
 
 	// Watermark внутри окна — закрывать нечего.
 	require.Empty(t, a.Expired(baseTime))
 
 	// Сделка следующей минуты открывает второе окно и уводит watermark
 	// за дедлайн первого (10:16:00 + grace 2s = 10:16:02).
-	a.Add(trade("BTC-USDT", "120", "1", baseTime.Add(65*time.Second)))
+	addLive(a, trade("BTC-USDT", "120", "1", baseTime.Add(65*time.Second)))
 	require.Equal(t, 2, a.Stats().OpenWindows, "оба окна открыты одновременно")
 
 	closed := a.Expired(baseTime)
@@ -104,20 +111,20 @@ func TestGraceAcceptsLateTrade(t *testing.T) {
 	a := newTestAggregator(t, domain.TF1s)
 
 	// Окно 10:15:00.
-	a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(500*time.Millisecond)))
+	addLive(a, trade("BTC-USDT", "100", "1", baseTime.Add(500*time.Millisecond)))
 
 	// Сделка следующей секунды: окно 10:15:00 остаётся открытым,
 	// рядом открывается 10:15:01.
-	a.Add(trade("BTC-USDT", "200", "1", baseTime.Add(1200*time.Millisecond)))
+	addLive(a, trade("BTC-USDT", "200", "1", baseTime.Add(1200*time.Millisecond)))
 	require.Equal(t, 2, a.Stats().OpenWindows)
 
 	// Отставшая сделка из первой секунды — её окно ещё живо (дедлайн
 	// 10:15:01 + 2s = 10:15:03), значит она принимается.
-	a.Add(trade("BTC-USDT", "150", "3", baseTime.Add(800*time.Millisecond)))
+	addLive(a, trade("BTC-USDT", "150", "3", baseTime.Add(800*time.Millisecond)))
 	require.Equal(t, int64(0), a.Stats().Late, "сделка внутри grace не опоздала")
 
 	// Уводим watermark за дедлайн первого окна.
-	a.Add(trade("BTC-USDT", "210", "1", baseTime.Add(3500*time.Millisecond)))
+	addLive(a, trade("BTC-USDT", "210", "1", baseTime.Add(3500*time.Millisecond)))
 
 	closed := a.Expired(baseTime)
 	require.Len(t, closed, 1)
@@ -136,7 +143,7 @@ func TestCloseByIdleTimeout(t *testing.T) {
 
 	a := newTestAggregator(t)
 
-	a.Add(trade("BTC-USDC", "100", "1", baseTime.Add(10*time.Second)))
+	addLive(a, trade("BTC-USDC", "100", "1", baseTime.Add(10*time.Second)))
 
 	// Дедлайн окна: 10:16:00 + grace 2s = 10:16:02.
 	// Порог простоя: дедлайн + idle 3s = 10:16:05.
@@ -155,13 +162,13 @@ func TestLateTradeDroppedAfterClose(t *testing.T) {
 
 	a := newTestAggregator(t)
 
-	a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(10*time.Second)))
+	addLive(a, trade("BTC-USDT", "100", "1", baseTime.Add(10*time.Second)))
 
 	closed := a.Expired(baseTime.Add(70 * time.Second))
 	require.Len(t, closed, 1, "окно закрыто по простою")
 	require.Equal(t, 0, a.Stats().OpenWindows)
 
-	a.Add(trade("BTC-USDT", "150", "5", baseTime.Add(20*time.Second)))
+	addLive(a, trade("BTC-USDT", "150", "5", baseTime.Add(20*time.Second)))
 
 	stats := a.Stats()
 	require.Equal(t, int64(1), stats.Late)
@@ -175,14 +182,14 @@ func TestMultipleTimeframesFromOneStream(t *testing.T) {
 
 	a := newTestAggregator(t, domain.TF1s, domain.TF1m)
 
-	a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(100*time.Millisecond)))
-	a.Add(trade("BTC-USDT", "110", "1", baseTime.Add(200*time.Millisecond)))
+	addLive(a, trade("BTC-USDT", "100", "1", baseTime.Add(100*time.Millisecond)))
+	addLive(a, trade("BTC-USDT", "110", "1", baseTime.Add(200*time.Millisecond)))
 
 	require.Equal(t, 2, a.Stats().OpenWindows, "одно окно 1s и одно 1m")
 
 	// Сделка следующей секунды: открывается второе секундное окно,
 	// минутное остаётся тем же.
-	a.Add(trade("BTC-USDT", "120", "1", baseTime.Add(1200*time.Millisecond)))
+	addLive(a, trade("BTC-USDT", "120", "1", baseTime.Add(1200*time.Millisecond)))
 	require.Equal(t, 3, a.Stats().OpenWindows)
 
 	// Watermark 10:15:01.2 ещё не дошёл до дедлайна окна 10:15:00
@@ -190,7 +197,7 @@ func TestMultipleTimeframesFromOneStream(t *testing.T) {
 	require.Empty(t, a.Expired(baseTime))
 
 	// Уводим время биржи вперёд: закрывается только секундное окно 10:15:00.
-	a.Add(trade("BTC-USDT", "130", "1", baseTime.Add(3500*time.Millisecond)))
+	addLive(a, trade("BTC-USDT", "130", "1", baseTime.Add(3500*time.Millisecond)))
 	closed := a.Expired(baseTime)
 	require.Len(t, closed, 1)
 	require.Equal(t, domain.TF1s, closed[0].Timeframe)
@@ -227,7 +234,7 @@ func TestEmptyIntervalProducesNoCandle(t *testing.T) {
 
 	a := newTestAggregator(t, domain.TF1s)
 
-	a.Add(trade("BTC-USDC", "100", "1", baseTime.Add(500*time.Millisecond)))
+	addLive(a, trade("BTC-USDC", "100", "1", baseTime.Add(500*time.Millisecond)))
 
 	// Проходит пятнадцать секунд без единой сделки.
 	closed := a.Expired(baseTime.Add(15 * time.Second))
@@ -244,11 +251,11 @@ func TestSymbolsAreIndependent(t *testing.T) {
 
 	a := newTestAggregator(t)
 
-	a.Add(trade("BTC-USDC", "100", "1", baseTime.Add(time.Second)))
-	a.Add(trade("BTC-USDT", "200", "1", baseTime.Add(time.Second)))
+	addLive(a, trade("BTC-USDC", "100", "1", baseTime.Add(time.Second)))
+	addLive(a, trade("BTC-USDT", "200", "1", baseTime.Add(time.Second)))
 
 	// BTC-USDT уходит далеко вперёд по времени биржи.
-	a.Add(trade("BTC-USDT", "210", "1", baseTime.Add(5*time.Minute)))
+	addLive(a, trade("BTC-USDT", "210", "1", baseTime.Add(5*time.Minute)))
 
 	// Системные часы стоят на 10:15:30 — порог простоя не достигнут ни для
 	// одного окна, поэтому закрывается ровно то, что закрыл watermark.
@@ -273,8 +280,8 @@ func TestFlushClosesPartialWindows(t *testing.T) {
 
 	a := newTestAggregator(t, domain.TF1s, domain.TF1m)
 
-	a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(time.Second)))
-	a.Add(trade("ETH-USDT", "50", "2", baseTime.Add(time.Second)))
+	addLive(a, trade("BTC-USDT", "100", "1", baseTime.Add(time.Second)))
+	addLive(a, trade("ETH-USDT", "50", "2", baseTime.Add(time.Second)))
 	require.Equal(t, 4, a.Stats().OpenWindows)
 
 	closed := a.Flush()
@@ -291,9 +298,9 @@ func TestClosedCandlesAreSorted(t *testing.T) {
 
 	a := newTestAggregator(t, domain.TF1s, domain.TF1m)
 
-	a.Add(trade("ETH-USDT", "50", "1", baseTime.Add(2*time.Second)))
-	a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(time.Second)))
-	a.Add(trade("BTC-USDC", "70", "1", baseTime.Add(time.Second)))
+	addLive(a, trade("ETH-USDT", "50", "1", baseTime.Add(2*time.Second)))
+	addLive(a, trade("BTC-USDT", "100", "1", baseTime.Add(time.Second)))
+	addLive(a, trade("BTC-USDC", "70", "1", baseTime.Add(time.Second)))
 
 	closed := a.Flush()
 	require.Len(t, closed, 6)
@@ -316,8 +323,8 @@ func TestStats(t *testing.T) {
 
 	a := newTestAggregator(t, domain.TF1s, domain.TF1m)
 
-	a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(time.Second)))
-	a.Add(trade("BTC-USDT", "110", "1", baseTime.Add(2*time.Second)))
+	addLive(a, trade("BTC-USDT", "100", "1", baseTime.Add(time.Second)))
+	addLive(a, trade("BTC-USDT", "110", "1", baseTime.Add(2*time.Second)))
 	a.Expired(baseTime.Add(10 * time.Minute))
 
 	stats := a.Stats()
@@ -337,7 +344,7 @@ func TestOpenWindowsAreBounded(t *testing.T) {
 
 	for i := range 600 {
 		at := baseTime.Add(time.Duration(i) * 100 * time.Millisecond)
-		a.Add(trade("BTC-USDT", "100", "1", at))
+		addLive(a, trade("BTC-USDT", "100", "1", at))
 		a.Expired(at)
 	}
 
@@ -346,25 +353,57 @@ func TestOpenWindowsAreBounded(t *testing.T) {
 	require.Equal(t, int64(0), a.Stats().Late)
 }
 
-// TestConcurrentAddAndExpired проверяет, что состояние защищено: обработка
-// батча и тикер дедлайнов работают в разных горутинах.
-// Осмысленен только под -race.
-func TestConcurrentAddAndExpired(t *testing.T) {
+// TestBacklogReplayKeepsWholeWindow воспроизводит разбор накопленного в
+// топике: время событий далеко позади системных часов, а сделки одной минуты
+// приходят двумя батчами с проверкой дедлайнов между ними.
+//
+// Без второго условия в проверке простоя окно закрывалось бы сразу после
+// первого батча, и сделки второго терялись бы как опоздавшие — свеча вышла
+// бы с заниженными объёмом и числом сделок.
+func TestBacklogReplayKeepsWholeWindow(t *testing.T) {
 	t.Parallel()
 
-	a := newTestAggregator(t, domain.TF1s, domain.TF1m)
+	a := newTestAggregator(t)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := range 1000 {
-			a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(time.Duration(i)*time.Millisecond)))
-		}
-	}()
+	// Часы сервиса на час впереди времени биржи — так выглядит разбор хвоста.
+	wall := baseTime.Add(time.Hour)
 
-	for range 1000 {
-		a.Expired(baseTime.Add(time.Minute))
-		a.Stats()
-	}
-	<-done
+	// Первый батч: половина минуты.
+	a.Add(trade("BTC-USDT", "100", "1", baseTime.Add(10*time.Second)), wall)
+	a.Add(trade("BTC-USDT", "110", "1", baseTime.Add(20*time.Second)), wall)
+
+	require.Empty(t, a.Expired(wall), "окно не должно закрыться посреди разбора")
+
+	// Второй батч приходит почти сразу — так и работает перечитывание.
+	wall = wall.Add(50 * time.Millisecond)
+	a.Add(trade("BTC-USDT", "90", "1", baseTime.Add(40*time.Second)), wall)
+	a.Add(trade("BTC-USDT", "105", "1", baseTime.Add(50*time.Second)), wall)
+
+	require.Equal(t, int64(0), a.Stats().Late, "сделки второго батча не опоздали")
+
+	// Окно закрывает watermark, когда доходит очередь до следующей минуты.
+	wall = wall.Add(50 * time.Millisecond)
+	a.Add(trade("BTC-USDT", "120", "1", baseTime.Add(65*time.Second)), wall)
+
+	closed := a.Expired(wall)
+	require.Len(t, closed, 1)
+	require.Equal(t, int64(4), closed[0].TradeCount, "в свече все четыре сделки минуты")
+	require.Equal(t, "110", closed[0].High.String())
+	require.Equal(t, "90", closed[0].Low.String())
+	require.Equal(t, "4", closed[0].Volume.String())
+}
+
+// TestIdleCloseWaitsForWindowPeriod проверяет вторую половину условия простоя:
+// окно нельзя закрыть раньше, чем истечёт его собственный интервал, иначе
+// минутная свеча схлопнулась бы через несколько секунд после первой сделки.
+func TestIdleCloseWaitsForWindowPeriod(t *testing.T) {
+	t.Parallel()
+
+	a := newTestAggregator(t)
+
+	addLive(a, trade("BTC-USDC", "100", "1", baseTime.Add(time.Second)))
+
+	// Простоя уже больше grace+idle, но минута ещё не кончилась.
+	require.Empty(t, a.Expired(baseTime.Add(30*time.Second)))
+	require.Equal(t, 1, a.Stats().OpenWindows)
 }

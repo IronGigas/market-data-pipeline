@@ -143,14 +143,19 @@ func New(cfg Config) (*Aggregator, error) {
 
 // Add разносит сделку по окнам всех таймфреймов.
 //
+// now — текущее время по часам сервиса; оно запоминается в окне и позже
+// используется для отсчёта простоя. Передаётся параметром, а не берётся
+// внутри: иначе логику закрытия окон нельзя было бы проверить тестами,
+// не дожидаясь реальных секунд.
+//
 // Ничего не закрывает и не возвращает: закрытием занимается только Expired.
 // Вызывающий обязан дёргать Expired регулярно, иначе свечи не появятся.
-func (a *Aggregator) Add(trade domain.Trade) {
+func (a *Aggregator) Add(trade domain.Trade, now time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	for _, tf := range a.timeframes {
-		a.addToTimeframe(trade, tf)
+		a.addToTimeframe(trade, tf, now)
 	}
 
 	a.trades++
@@ -163,7 +168,7 @@ func (a *Aggregator) Add(trade domain.Trade) {
 }
 
 // addToTimeframe кладёт сделку в её окно, открывая его при необходимости.
-func (a *Aggregator) addToTimeframe(trade domain.Trade, tf domain.Timeframe) {
+func (a *Aggregator) addToTimeframe(trade domain.Trade, tf domain.Timeframe, now time.Time) {
 	openTime := tf.Truncate(trade.EventTime)
 	key := WindowKey{Symbol: trade.Symbol, Timeframe: tf}
 
@@ -183,11 +188,11 @@ func (a *Aggregator) addToTimeframe(trade domain.Trade, tf domain.Timeframe) {
 
 	id := newWindowID(key, openTime)
 	if window, ok := a.windows[id]; ok {
-		window.apply(trade)
+		window.apply(trade, now)
 		return
 	}
 
-	a.windows[id] = newWindow(key, openTime, trade)
+	a.windows[id] = newWindow(key, openTime, trade, now)
 }
 
 // Expired закрывает окна, у которых наступил дедлайн, и возвращает свечи.
@@ -221,10 +226,26 @@ func (a *Aggregator) isExpired(window *Window, now time.Time) bool {
 		return true
 	}
 
-	// Страховка по системным часам — на случай, если поток по инструменту
-	// иссяк и watermark стоит на месте. Без неё последняя свеча замолчавшего
-	// инструмента висела бы открытой бесконечно.
-	return !now.Before(deadline.Add(a.idleTimeout))
+	// Страховка на случай, если поток по инструменту иссяк и watermark стоит
+	// на месте. Без неё последняя свеча замолчавшего инструмента висела бы
+	// открытой бесконечно.
+	//
+	// Условий два, и оба обязательны.
+	//
+	// Первое — интервал окна истёк по системным часам. Без него минутное
+	// окно закрывалось бы через несколько секунд после первой сделки,
+	// не дождавшись своей минуты.
+	//
+	// Второе — в окно давно ничего не клали. Без него страховка ломается при
+	// разборе накопленного в топике: там системные часы уходят вперёд от
+	// времени биржи на часы, первое условие истинно сразу, и окно
+	// закрывалось бы прямо после создания, а сделки той же минуты из
+	// следующего батча терялись бы как опоздавшие.
+	//
+	// В живой работе обе шкалы идут рядом, и условия выполняются почти
+	// одновременно — поведение то же, что и без второго.
+	return !now.Before(deadline.Add(a.idleTimeout)) &&
+		!now.Before(window.UpdatedAt.Add(a.grace+a.idleTimeout))
 }
 
 // Flush закрывает все открытые окна и возвращает их свечи.

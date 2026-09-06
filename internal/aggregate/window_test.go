@@ -28,7 +28,7 @@ func TestNewWindowFromSingleTrade(t *testing.T) {
 	t.Parallel()
 
 	openTime := time.Date(2026, 9, 3, 10, 15, 0, 0, time.UTC)
-	w := newWindow(testKey, openTime, tradeAt("64250.15", "0.5", openTime))
+	w := newWindow(testKey, openTime, tradeAt("64250.15", "0.5", openTime), openTime)
 
 	// Свеча из одной сделки имеет нулевой размах, но не нулевые high и low.
 	require.Equal(t, "64250.15", w.Open.String())
@@ -83,9 +83,9 @@ func TestWindowApply(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			w := newWindow(testKey, openTime, tradeAt(tc.prices[0], "1", openTime))
+			w := newWindow(testKey, openTime, tradeAt(tc.prices[0], "1", openTime), openTime)
 			for _, price := range tc.prices[1:] {
-				w.apply(tradeAt(price, "1", openTime))
+				w.apply(tradeAt(price, "1", openTime), openTime)
 			}
 
 			require.Equal(t, tc.wantO, w.Open.String(), "open")
@@ -104,9 +104,9 @@ func TestWindowVolumeIsExact(t *testing.T) {
 
 	openTime := time.Date(2026, 9, 3, 10, 15, 0, 0, time.UTC)
 
-	w := newWindow(testKey, openTime, tradeAt("100", "0.1", openTime))
-	w.apply(tradeAt("100", "0.2", openTime))
-	w.apply(tradeAt("100", "0.3", openTime))
+	w := newWindow(testKey, openTime, tradeAt("100", "0.1", openTime), openTime)
+	w.apply(tradeAt("100", "0.2", openTime), openTime)
+	w.apply(tradeAt("100", "0.3", openTime), openTime)
 
 	require.Equal(t, "0.6", w.Volume.String())
 }
@@ -130,7 +130,7 @@ func TestWindowCloseTime(t *testing.T) {
 			t.Parallel()
 
 			key := WindowKey{Symbol: "BTC-USDT", Timeframe: tc.tf}
-			w := newWindow(key, openTime, tradeAt("100", "1", openTime))
+			w := newWindow(key, openTime, tradeAt("100", "1", openTime), openTime)
 
 			require.True(t, w.CloseTime().Equal(tc.want), "want %s, got %s", tc.want, w.CloseTime())
 			require.True(t, w.deadline(2*time.Second).Equal(tc.want.Add(2*time.Second)))
@@ -143,9 +143,9 @@ func TestWindowCandle(t *testing.T) {
 
 	openTime := time.Date(2026, 9, 3, 10, 15, 0, 0, time.UTC)
 
-	w := newWindow(testKey, openTime, tradeAt("100", "1.5", openTime))
-	w.apply(tradeAt("130", "0.5", openTime))
-	w.apply(tradeAt("90", "2", openTime))
+	w := newWindow(testKey, openTime, tradeAt("100", "1.5", openTime), openTime)
+	w.apply(tradeAt("130", "0.5", openTime), openTime)
+	w.apply(tradeAt("90", "2", openTime), openTime)
 
 	candle := w.Candle()
 

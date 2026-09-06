@@ -23,26 +23,6 @@ type Symbol string
 // String реализует fmt.Stringer.
 func (s Symbol) String() string { return string(s) }
 
-// Base возвращает базовый актив ("BTC" для "BTC-USDT").
-// Для символа, не прошедшего ParseSymbol, вернёт пустую строку.
-func (s Symbol) Base() string {
-	base, _, ok := strings.Cut(string(s), symbolSeparator)
-	if !ok {
-		return ""
-	}
-	return base
-}
-
-// Quote возвращает котируемый актив ("USDT" для "BTC-USDT").
-// Для символа, не прошедшего ParseSymbol, вернёт пустую строку.
-func (s Symbol) Quote() string {
-	_, quote, ok := strings.Cut(string(s), symbolSeparator)
-	if !ok {
-		return ""
-	}
-	return quote
-}
-
 const symbolSeparator = "-"
 
 // ParseSymbol нормализует и валидирует доменный символ: обрезает пробелы,

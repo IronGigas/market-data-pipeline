@@ -217,13 +217,17 @@ func consumeOnce(ctx context.Context, consumer *kafka.Consumer, sink *candleSink
 		return err
 	}
 
+	// Одно время на весь батч: сделки батча пришли фактически одновременно,
+	// и разное now у них означало бы разный отсчёт простоя без причины.
+	now := time.Now()
+
 	for _, trade := range trades {
-		aggregator.Add(trade)
+		aggregator.Add(trade, now)
 	}
 
 	// Проверка дедлайнов идёт всегда, даже если батч пустой: по редкому
 	// инструменту окно должно закрыться и без новых сделок.
-	if err := sink.write(ctx, aggregator.Expired(time.Now())); err != nil {
+	if err := sink.write(ctx, aggregator.Expired(now)); err != nil {
 		return err
 	}
 
