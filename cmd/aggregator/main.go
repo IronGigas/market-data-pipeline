@@ -42,6 +42,15 @@ const (
 // на недоступной базе, когда пользователь уже нажал Ctrl+C, нельзя.
 const flushTimeout = 5 * time.Second
 
+// statsInterval — период сводки в логе. Чаще, чем у ingestor: здесь по
+// сводке видно не только объём потока, но и размер состояния и отставание
+// группы, а они меняются быстрее.
+const statsInterval = 5 * time.Second
+
+// lagTimeout ограничивает запрос отставания у брокера: сводка не должна
+// задерживаться из-за медленного ответа.
+const lagTimeout = 3 * time.Second
+
 func main() {
 	cfg, err := config.LoadAggregator()
 	if err != nil {
@@ -118,25 +127,43 @@ func run(cfg config.Aggregator, log *slog.Logger) error {
 
 	sink := &candleSink{store: candles, producer: producer, log: log}
 
-	loopErr := consume(ctx, consumer, sink, aggregator)
+	// Сводка печатается из отдельной горутины: основной цикл не должен
+	// отвлекаться на запрос отставания у брокера.
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		reportStats(ctx, log, consumer, aggregator)
+	}()
 
-	// Остановка: открытые окна дописываются как частичные свечи, иначе
-	// накопленные сделки последнего интервала пропали бы бесследно.
+	loopErr := consume(ctx, consumer, sink, aggregator)
+	<-statsDone
+
+	// Порядок остановки: закрыть окна и записать их, слить буфер продюсера,
+	// закоммитить оффсеты, и только потом отпустить соединения.
+	//
+	// Контекст сервиса уже отменён сигналом, поэтому последние операции
+	// работают на отдельном контексте с собственным таймаутом.
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
+	defer cancel()
+
+	// Открытые окна дописываются как частичные свечи, иначе накопленные
+	// сделки последнего интервала пропали бы бесследно.
 	if partial := aggregator.Flush(); len(partial) > 0 {
 		log.Info("flushing open windows", slog.Int("candles", len(partial)))
-
-		// Контекст сервиса уже отменён сигналом, поэтому для последней
-		// записи берётся свежий с собственным таймаутом.
-		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
-		if err := sink.write(flushCtx, partial); err != nil {
+		if err := sink.write(shutdownCtx, partial); err != nil {
 			log.Error("failed to persist partial candles", slog.String("error", err.Error()))
 		}
-		cancel()
 	}
 
 	// Продюсер закрывается после последней записи: Flush внутри Close
 	// дожидается отправки накопленных свечей.
 	closeErr := producer.Close()
+
+	// Коммит последним. Если он не пройдёт, последний батч обработается
+	// повторно при следующем запуске — это безопасно, свечи идемпотентны.
+	if err := consumer.Commit(shutdownCtx); err != nil {
+		log.Warn("failed to commit offsets on shutdown", slog.String("error", err.Error()))
+	}
 
 	stats := aggregator.Stats()
 	consumerStats := consumer.Stats()
@@ -317,4 +344,44 @@ func closedByTimeframe(stats aggregate.Stats) map[string]int64 {
 		closed[tf.String()] = n
 	}
 	return closed
+}
+
+// reportStats раз в statsInterval печатает сводку и завершается по отмене ctx.
+func reportStats(ctx context.Context, log *slog.Logger, consumer *kafka.Consumer, aggregator *aggregate.Aggregator) {
+	ticker := time.NewTicker(statsInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			stats := aggregator.Stats()
+			consumerStats := consumer.Stats()
+
+			attrs := []any{
+				slog.Int64("trades", stats.Trades),
+				slog.Int64("late", stats.Late),
+				slog.Int64("malformed", consumerStats.Failed),
+				slog.Int64("commits", consumerStats.Commits),
+				// Размер состояния: если он растёт, окна перестали
+				// закрываться, и это видно раньше, чем кончится память.
+				slog.Int("open_windows", stats.OpenWindows),
+				slog.Any("closed", closedByTimeframe(stats)),
+			}
+
+			lagCtx, cancel := context.WithTimeout(ctx, lagTimeout)
+			lag, err := consumer.Lag(lagCtx)
+			cancel()
+			if err != nil {
+				// Отставание — справочная величина: не смогли получить,
+				// печатаем сводку без него.
+				attrs = append(attrs, slog.String("lag_error", err.Error()))
+			} else {
+				attrs = append(attrs, slog.Int64("lag", lag))
+			}
+
+			log.Info("aggregator stats", attrs...)
+		}
+	}
 }

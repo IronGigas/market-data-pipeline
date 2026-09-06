@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/IronGigas/market-data-pipeline/internal/domain"
@@ -185,6 +186,27 @@ func (c *Consumer) Commit(ctx context.Context) error {
 // партиции при появлении второго экземпляра сервиса.
 func (c *Consumer) Release() {
 	c.client.AllowRebalance()
+}
+
+// Lag возвращает суммарное отставание группы от конца топика.
+//
+// Отставание спрашивается у брокера, а не считается по локальному состоянию:
+// интересует именно официальная картина — сколько сообщений записано и по
+// какой оффсет группа отчиталась. Это главный признак того, успевает ли
+// агрегатор за потоком.
+func (c *Consumer) Lag(ctx context.Context) (int64, error) {
+	lags, err := kadm.NewClient(c.client).Lag(ctx, c.group)
+	if err != nil {
+		return 0, fmt.Errorf("kafka: describe lag: %w", err)
+	}
+
+	var total int64
+	for _, group := range lags {
+		// Total суммирует только партиции с закоммиченным оффсетом:
+		// у партиции без коммита отставание не определено.
+		total += group.Lag.Total()
+	}
+	return total, nil
 }
 
 // Stats возвращает снимок счётчиков.

@@ -73,6 +73,12 @@ type Stats struct {
 	Skipped    int64 // сообщения не о сделке или по чужому инструменту
 	Failed     int64 // сообщения, которые не удалось разобрать
 	Reconnects int64
+
+	// BySymbol — сколько сделок пришло по каждому инструменту.
+	// Именно эта разбивка показывает неравномерность потока: по BTC-USDT
+	// сделок на порядки больше, чем по BTC-USDC, и та же неравномерность
+	// потом видна в загрузке партиций Kafka.
+	BySymbol map[domain.Symbol]int64
 }
 
 // Client читает сделки из комбинированного потока Binance.
@@ -97,6 +103,11 @@ type Client struct {
 	skipped    atomic.Int64
 	failed     atomic.Int64
 	reconnects atomic.Int64
+
+	// bySymbol — счётчики сделок по инструментам. Мапа заполняется в New и
+	// больше не меняется, поэтому читать её из другой горутины безопасно:
+	// синхронизации требуют только значения, и они атомарные.
+	bySymbol map[domain.Symbol]*atomic.Int64
 
 	// lastTradeID — последний виденный TradeID по каждому инструменту.
 	// Читается и пишется только горутиной Run.
@@ -126,6 +137,11 @@ func New(cfg Config) (*Client, error) {
 		readLimit = defaultReadLimit
 	}
 
+	bySymbol := make(map[domain.Symbol]*atomic.Int64, len(cfg.Symbols))
+	for _, symbol := range cfg.Symbols {
+		bySymbol[symbol] = &atomic.Int64{}
+	}
+
 	return &Client{
 		url:          cfg.URL,
 		symbols:      cfg.Symbols,
@@ -137,18 +153,25 @@ func New(cfg Config) (*Client, error) {
 		maxBackoff:   orDefault(cfg.MaxBackoff, defaultMaxBackoff),
 		stableAfter:  orDefault(cfg.StableAfter, defaultStableAfter),
 		readLimit:    readLimit,
+		bySymbol:     bySymbol,
 		lastTradeID:  make(map[domain.Symbol]int64, len(cfg.Symbols)),
 	}, nil
 }
 
 // Stats возвращает снимок счётчиков. Безопасен для вызова из другой горутины.
 func (c *Client) Stats() Stats {
+	bySymbol := make(map[domain.Symbol]int64, len(c.bySymbol))
+	for symbol, counter := range c.bySymbol {
+		bySymbol[symbol] = counter.Load()
+	}
+
 	return Stats{
 		Received:   c.received.Load(),
 		Duplicates: c.duplicates.Load(),
 		Skipped:    c.skipped.Load(),
 		Failed:     c.failed.Load(),
 		Reconnects: c.reconnects.Load(),
+		BySymbol:   bySymbol,
 	}
 }
 
@@ -264,6 +287,9 @@ func (c *Client) handleMessage(raw []byte, handler func(domain.Trade) error) err
 	}
 
 	c.received.Add(1)
+	if counter, ok := c.bySymbol[trade.Symbol]; ok {
+		counter.Add(1)
+	}
 	if err := handler(trade); err != nil {
 		return fmt.Errorf("%w: handler: %w", errFatal, err)
 	}
