@@ -25,6 +25,10 @@ type ProducerConfig struct {
 	Topic   string
 	Logger  *slog.Logger
 
+	// ClientID виден в метриках и логах брокера. Полезен, когда в кластер
+	// пишут оба сервиса: по нему сразу понятно, чей это клиент.
+	ClientID string
+
 	FlushTimeout time.Duration
 }
 
@@ -34,7 +38,8 @@ type ProducerStats struct {
 	Failed    int64 // записи, которые брокер не принял
 }
 
-// Producer публикует сделки в топик md.trades.
+// Producer публикует записи в один топик: сделки в md.trades или свечи
+// в md.candles, в зависимости от того, кто его создал.
 //
 // Публикация асинхронная: Produce ставит запись в буфер клиента и сразу
 // возвращает управление, а результат приходит в колбэк. Синхронная отправка
@@ -51,7 +56,7 @@ type Producer struct {
 	failed    atomic.Int64
 }
 
-// NewProducer подключается к брокерам и проверяет доступность топика.
+// NewProducer подключается к брокерам и проверяет связь.
 func NewProducer(ctx context.Context, cfg ProducerConfig) (*Producer, error) {
 	if len(cfg.Brokers) == 0 {
 		return nil, errors.New("kafka: no brokers configured")
@@ -68,13 +73,18 @@ func NewProducer(ctx context.Context, cfg ProducerConfig) (*Producer, error) {
 		flushTimeout = defaultFlushTimeout
 	}
 
+	clientID := strings.TrimSpace(cfg.ClientID)
+	if clientID == "" {
+		clientID = "mdp-producer"
+	}
+
+	// Идемпотентный продюсер включён в franz-go по умолчанию: он снимает
+	// дубликаты, которые иначе появились бы при внутренних повторах
+	// отправки. Явно не отключаем.
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.DefaultProduceTopic(cfg.Topic),
-		// Идемпотентный продюсер включён в franz-go по умолчанию: он снимает
-		// дубликаты, которые иначе появились бы при внутренних повторах
-		// отправки. Явно не отключаем.
-		kgo.ClientID("mdp-ingestor"),
+		kgo.ClientID(clientID),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("kafka: create client: %w", err)
@@ -95,39 +105,74 @@ func NewProducer(ctx context.Context, cfg ProducerConfig) (*Producer, error) {
 	}, nil
 }
 
-// Publish ставит сделку в очередь отправки и сразу возвращает управление.
-//
-// Ошибки не возвращаются, а считаются и логируются: одна непринятая сделка
-// не повод останавливать конвейер, а вызывающий код всё равно не смог бы
-// сделать с ней ничего осмысленного.
-func (p *Producer) Publish(ctx context.Context, trade domain.Trade) {
+// PublishTrade ставит сделку в очередь отправки в топик сделок.
+func (p *Producer) PublishTrade(ctx context.Context, trade domain.Trade) {
 	value, err := EncodeTrade(trade)
 	if err != nil {
-		p.failed.Add(1)
-		p.log.Error("encode trade failed",
+		p.encodeFailed("trade", err,
 			slog.String("symbol", trade.Symbol.String()),
-			slog.Int64("trade_id", trade.TradeID),
-			slog.String("error", err.Error()))
+			slog.Int64("trade_id", trade.TradeID))
 		return
 	}
 
+	p.publish(ctx, TradeKey(trade), value, "trade",
+		slog.String("symbol", trade.Symbol.String()),
+		slog.Int64("trade_id", trade.TradeID))
+}
+
+// PublishCandle ставит закрытую свечу в очередь отправки в топик свечей.
+//
+// Публикуются только закрытые свечи: потребитель топика вправе считать
+// каждое сообщение окончательным результатом по своему окну.
+func (p *Producer) PublishCandle(ctx context.Context, candle domain.Candle) {
+	value, err := EncodeCandle(candle)
+	if err != nil {
+		p.encodeFailed("candle", err,
+			slog.String("symbol", candle.Symbol.String()),
+			slog.String("timeframe", candle.Timeframe.String()))
+		return
+	}
+
+	p.publish(ctx, CandleKey(candle), value, "candle",
+		slog.String("symbol", candle.Symbol.String()),
+		slog.String("timeframe", candle.Timeframe.String()),
+		slog.Time("open_time", candle.OpenTime))
+}
+
+// publish отправляет запись асинхронно.
+//
+// Ошибки не возвращаются, а считаются и логируются: одна непринятая запись
+// не повод останавливать конвейер, а вызывающий код всё равно не смог бы
+// сделать с ней ничего осмысленного. Для свечей это безопасно ещё и потому,
+// что они уже лежат в базе — топик здесь вторичен.
+func (p *Producer) publish(ctx context.Context, key, value []byte, kind string, attrs ...slog.Attr) {
 	record := &kgo.Record{
 		Topic: p.topic,
-		Key:   TradeKey(trade),
+		Key:   key,
 		Value: value,
 	}
 
 	p.client.Produce(ctx, record, func(_ *kgo.Record, err error) {
 		if err != nil {
 			p.failed.Add(1)
-			p.log.Error("publish trade failed",
-				slog.String("symbol", trade.Symbol.String()),
-				slog.Int64("trade_id", trade.TradeID),
-				slog.String("error", err.Error()))
+			p.log.LogAttrs(context.Background(), slog.LevelError, "publish failed",
+				append([]slog.Attr{
+					slog.String("kind", kind),
+					slog.String("error", err.Error()),
+				}, attrs...)...)
 			return
 		}
 		p.published.Add(1)
 	})
+}
+
+func (p *Producer) encodeFailed(kind string, err error, attrs ...slog.Attr) {
+	p.failed.Add(1)
+	p.log.LogAttrs(context.Background(), slog.LevelError, "encode failed",
+		append([]slog.Attr{
+			slog.String("kind", kind),
+			slog.String("error", err.Error()),
+		}, attrs...)...)
 }
 
 // Stats возвращает снимок счётчиков. Безопасен для вызова из другой горутины.

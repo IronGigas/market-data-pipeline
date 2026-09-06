@@ -107,3 +107,121 @@ func DecodeTrade(raw []byte) (domain.Trade, error) {
 func TradeKey(trade domain.Trade) []byte {
 	return []byte(trade.Symbol)
 }
+
+// candleMessage — представление свечи в топике md.candles.
+//
+// Денежные величины строками по той же причине, что и у сделок: JSON-число
+// проходит через float64 и теряет последние знаки.
+type candleMessage struct {
+	Symbol     string `json:"symbol"`
+	Timeframe  string `json:"timeframe"`
+	OpenTime   string `json:"open_time"`
+	CloseTime  string `json:"close_time"`
+	Open       string `json:"open"`
+	High       string `json:"high"`
+	Low        string `json:"low"`
+	Close      string `json:"close"`
+	Volume     string `json:"volume"`
+	TradeCount int64  `json:"trade_count"`
+}
+
+// EncodeCandle сериализует свечу для публикации в Kafka.
+func EncodeCandle(candle domain.Candle) ([]byte, error) {
+	msg := candleMessage{
+		Symbol:     candle.Symbol.String(),
+		Timeframe:  candle.Timeframe.String(),
+		OpenTime:   candle.OpenTime.UTC().Format(timeLayout),
+		CloseTime:  candle.CloseTime.UTC().Format(timeLayout),
+		Open:       candle.Open.String(),
+		High:       candle.High.String(),
+		Low:        candle.Low.String(),
+		Close:      candle.Close.String(),
+		Volume:     candle.Volume.String(),
+		TradeCount: candle.TradeCount,
+	}
+
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("encode candle: %w", err)
+	}
+	return raw, nil
+}
+
+// DecodeCandle разбирает сообщение из топика md.candles.
+func DecodeCandle(raw []byte) (domain.Candle, error) {
+	var msg candleMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return domain.Candle{}, fmt.Errorf("decode candle: %w", err)
+	}
+
+	symbol, err := domain.ParseSymbol(msg.Symbol)
+	if err != nil {
+		return domain.Candle{}, fmt.Errorf("decode candle: %w", err)
+	}
+
+	timeframe, err := domain.ParseTimeframe(msg.Timeframe)
+	if err != nil {
+		return domain.Candle{}, fmt.Errorf("decode candle: %w", err)
+	}
+
+	openTime, err := time.Parse(time.RFC3339, msg.OpenTime)
+	if err != nil {
+		return domain.Candle{}, fmt.Errorf("decode candle: open_time %q: %w", msg.OpenTime, err)
+	}
+
+	closeTime, err := time.Parse(time.RFC3339, msg.CloseTime)
+	if err != nil {
+		return domain.Candle{}, fmt.Errorf("decode candle: close_time %q: %w", msg.CloseTime, err)
+	}
+
+	open, err := parseAmount("open", msg.Open)
+	if err != nil {
+		return domain.Candle{}, err
+	}
+	high, err := parseAmount("high", msg.High)
+	if err != nil {
+		return domain.Candle{}, err
+	}
+	low, err := parseAmount("low", msg.Low)
+	if err != nil {
+		return domain.Candle{}, err
+	}
+	closePrice, err := parseAmount("close", msg.Close)
+	if err != nil {
+		return domain.Candle{}, err
+	}
+	volume, err := parseAmount("volume", msg.Volume)
+	if err != nil {
+		return domain.Candle{}, err
+	}
+
+	return domain.Candle{
+		Symbol:     symbol,
+		Timeframe:  timeframe,
+		OpenTime:   openTime.UTC(),
+		CloseTime:  closeTime.UTC(),
+		Open:       open,
+		High:       high,
+		Low:        low,
+		Close:      closePrice,
+		Volume:     volume,
+		TradeCount: msg.TradeCount,
+	}, nil
+}
+
+func parseAmount(field, raw string) (decimal.Decimal, error) {
+	value, err := decimal.NewFromString(raw)
+	if err != nil {
+		return decimal.Decimal{}, fmt.Errorf("decode candle: %s %q: %w", field, raw, err)
+	}
+	return value, nil
+}
+
+// CandleKey возвращает ключ партиционирования для свечи.
+//
+// Ключ включает таймфрейм, а не только символ: топик собран с
+// cleanup.policy=compact, и компакция оставляет последнее сообщение на
+// каждый ключ. Без таймфрейма секундная свеча вытесняла бы минутную.
+func CandleKey(candle domain.Candle) []byte {
+	return []byte(candle.Symbol.String() + "|" + candle.Timeframe.String())
+}

@@ -197,3 +197,148 @@ func TestTradeKey(t *testing.T) {
 	// и читаемость вывода консольного консьюмера.
 	require.Equal(t, []byte("BTC-USDT"), TradeKey(testTrade()))
 }
+
+func testCandle() domain.Candle {
+	return domain.Candle{
+		Symbol:     "BTC-USDT",
+		Timeframe:  domain.TF1m,
+		OpenTime:   time.Date(2026, 9, 3, 10, 15, 0, 0, time.UTC),
+		CloseTime:  time.Date(2026, 9, 3, 10, 16, 0, 0, time.UTC),
+		Open:       decimal.RequireFromString("64250.15"),
+		High:       decimal.RequireFromString("64301"),
+		Low:        decimal.RequireFromString("64244.8"),
+		Close:      decimal.RequireFromString("64288.42"),
+		Volume:     decimal.RequireFromString("12.4831"),
+		TradeCount: 1842,
+	}
+}
+
+// TestEncodeCandleFormat фиксирует контракт топика md.candles.
+func TestEncodeCandleFormat(t *testing.T) {
+	t.Parallel()
+
+	raw, err := EncodeCandle(testCandle())
+	require.NoError(t, err)
+
+	require.JSONEq(t, `{
+		"symbol": "BTC-USDT",
+		"timeframe": "1m",
+		"open_time": "2026-09-03T10:15:00.000Z",
+		"close_time": "2026-09-03T10:16:00.000Z",
+		"open": "64250.15",
+		"high": "64301",
+		"low": "64244.8",
+		"close": "64288.42",
+		"volume": "12.4831",
+		"trade_count": 1842
+	}`, string(raw))
+}
+
+func TestCandleRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		candle domain.Candle
+	}{
+		{name: "минутная свеча", candle: testCandle()},
+		{
+			name: "секундная свеча с длинным объёмом",
+			candle: domain.Candle{
+				Symbol:     "ETH-USDT",
+				Timeframe:  domain.TF1s,
+				OpenTime:   time.Date(2026, 9, 3, 10, 15, 30, 0, time.UTC),
+				CloseTime:  time.Date(2026, 9, 3, 10, 15, 31, 0, time.UTC),
+				Open:       decimal.RequireFromString("2453.87"),
+				High:       decimal.RequireFromString("2453.87"),
+				Low:        decimal.RequireFromString("2453.86"),
+				Close:      decimal.RequireFromString("2453.86"),
+				Volume:     decimal.RequireFromString("0.000000000000000001"),
+				TradeCount: 1,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := EncodeCandle(tc.candle)
+			require.NoError(t, err)
+
+			got, err := DecodeCandle(raw)
+			require.NoError(t, err)
+
+			require.Equal(t, tc.candle.Symbol, got.Symbol)
+			require.Equal(t, tc.candle.Timeframe, got.Timeframe)
+			require.True(t, tc.candle.OpenTime.Equal(got.OpenTime))
+			require.True(t, tc.candle.CloseTime.Equal(got.CloseTime))
+			require.Equal(t, tc.candle.TradeCount, got.TradeCount)
+
+			for _, pair := range []struct {
+				name     string
+				want, is decimal.Decimal
+			}{
+				{"open", tc.candle.Open, got.Open},
+				{"high", tc.candle.High, got.High},
+				{"low", tc.candle.Low, got.Low},
+				{"close", tc.candle.Close, got.Close},
+				{"volume", tc.candle.Volume, got.Volume},
+			} {
+				require.True(t, pair.want.Equal(pair.is), "%s: %s != %s", pair.name, pair.want, pair.is)
+			}
+		})
+	}
+}
+
+func TestDecodeCandleErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		raw    string
+		wantIs error
+	}{
+		{name: "битый JSON", raw: `{"symbol":`},
+		{
+			name:   "неизвестный таймфрейм",
+			raw:    `{"symbol":"BTC-USDT","timeframe":"1h","open_time":"2026-09-03T10:15:00.000Z","close_time":"2026-09-03T11:15:00.000Z","open":"1","high":"1","low":"1","close":"1","volume":"1","trade_count":1}`,
+			wantIs: domain.ErrUnknownTimeframe,
+		},
+		{
+			name:   "символ не в доменной форме",
+			raw:    `{"symbol":"BTCUSDT","timeframe":"1m","open_time":"2026-09-03T10:15:00.000Z","close_time":"2026-09-03T10:16:00.000Z","open":"1","high":"1","low":"1","close":"1","volume":"1","trade_count":1}`,
+			wantIs: domain.ErrInvalidSymbol,
+		},
+		{
+			name: "объём не число",
+			raw:  `{"symbol":"BTC-USDT","timeframe":"1m","open_time":"2026-09-03T10:15:00.000Z","close_time":"2026-09-03T10:16:00.000Z","open":"1","high":"1","low":"1","close":"1","volume":"x","trade_count":1}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := DecodeCandle([]byte(tc.raw))
+			require.Error(t, err)
+			if tc.wantIs != nil {
+				require.ErrorIs(t, err, tc.wantIs)
+			}
+		})
+	}
+}
+
+// TestCandleKey проверяет ключ компакции: без таймфрейма секундная свеча
+// вытесняла бы минутную по тому же инструменту.
+func TestCandleKey(t *testing.T) {
+	t.Parallel()
+
+	minute := testCandle()
+	second := minute
+	second.Timeframe = domain.TF1s
+
+	require.Equal(t, []byte("BTC-USDT|1m"), CandleKey(minute))
+	require.Equal(t, []byte("BTC-USDT|1s"), CandleKey(second))
+	require.NotEqual(t, CandleKey(minute), CandleKey(second))
+}

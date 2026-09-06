@@ -1,7 +1,5 @@
-// Команда aggregator читает сделки из Kafka, собирает их в OHLCV-свечи и
-// сохраняет закрытые свечи в PostgreSQL.
-//
-// Публикация свечей в md.candles появится следующим этапом.
+// Команда aggregator читает сделки из Kafka, собирает их в OHLCV-свечи,
+// сохраняет закрытые свечи в PostgreSQL и публикует их в топик md.candles.
 package main
 
 import (
@@ -76,6 +74,16 @@ func run(cfg config.Aggregator, log *slog.Logger) error {
 
 	candles := postgres.NewCandleStore(db)
 
+	producer, err := kafka.NewProducer(ctx, kafka.ProducerConfig{
+		Brokers:  cfg.KafkaBrokers,
+		Topic:    cfg.TopicCandles,
+		ClientID: "mdp-aggregator",
+		Logger:   log,
+	})
+	if err != nil {
+		return err
+	}
+
 	consumer, err := kafka.NewConsumer(ctx, kafka.ConsumerConfig{
 		Brokers: cfg.KafkaBrokers,
 		Topic:   cfg.TopicTrades,
@@ -83,6 +91,7 @@ func run(cfg config.Aggregator, log *slog.Logger) error {
 		Logger:  log,
 	})
 	if err != nil {
+		_ = producer.Close()
 		return err
 	}
 	defer consumer.Close()
@@ -100,13 +109,16 @@ func run(cfg config.Aggregator, log *slog.Logger) error {
 	log.Info("aggregator started",
 		slog.Any("timeframes", cfg.Timeframes),
 		slog.Any("brokers", cfg.KafkaBrokers),
-		slog.String("topic", cfg.TopicTrades),
+		slog.String("topic_trades", cfg.TopicTrades),
+		slog.String("topic_candles", cfg.TopicCandles),
 		slog.String("group", cfg.ConsumerGroup),
 		slog.Duration("grace", cfg.Grace),
 		slog.Duration("idle_timeout", cfg.IdleTimeout),
 		slog.String("log_level", cfg.LogLevel.String()))
 
-	loopErr := consume(ctx, consumer, candles, aggregator, log)
+	sink := &candleSink{store: candles, producer: producer, log: log}
+
+	loopErr := consume(ctx, consumer, sink, aggregator)
 
 	// Остановка: открытые окна дописываются как частичные свечи, иначе
 	// накопленные сделки последнего интервала пропали бы бесследно.
@@ -116,25 +128,33 @@ func run(cfg config.Aggregator, log *slog.Logger) error {
 		// Контекст сервиса уже отменён сигналом, поэтому для последней
 		// записи берётся свежий с собственным таймаутом.
 		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
-		if err := store(flushCtx, candles, partial, log); err != nil {
+		if err := sink.write(flushCtx, partial); err != nil {
 			log.Error("failed to persist partial candles", slog.String("error", err.Error()))
-		} else {
-			emitCandles(log, partial)
 		}
 		cancel()
 	}
 
+	// Продюсер закрывается после последней записи: Flush внутри Close
+	// дожидается отправки накопленных свечей.
+	closeErr := producer.Close()
+
 	stats := aggregator.Stats()
 	consumerStats := consumer.Stats()
+	producerStats := producer.Stats()
 	log.Info("aggregator stopped",
 		slog.Int64("trades", stats.Trades),
 		slog.Int64("late", stats.Late),
 		slog.Int64("records", consumerStats.Records),
 		slog.Int64("malformed", consumerStats.Failed),
 		slog.Int64("commits", consumerStats.Commits),
+		slog.Int64("candles_published", producerStats.Published),
+		slog.Int64("publish_failed", producerStats.Failed),
 		slog.Any("closed", closedByTimeframe(stats)))
 
-	return loopErr
+	if loopErr != nil {
+		return loopErr
+	}
+	return closeErr
 }
 
 // consume крутит основной цикл до отмены контекста.
@@ -143,13 +163,13 @@ func run(cfg config.Aggregator, log *slog.Logger) error {
 // и обработка батча: опрос Kafka сам возвращается по таймауту, и отдельная
 // горутина-тикер только добавила бы гонку между свечами, закрытыми тикером,
 // и коммитом оффсетов батча.
-func consume(ctx context.Context, consumer *kafka.Consumer, candles *postgres.CandleStore, aggregator *aggregate.Aggregator, log *slog.Logger) error {
+func consume(ctx context.Context, consumer *kafka.Consumer, sink *candleSink, aggregator *aggregate.Aggregator) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		if err := consumeOnce(ctx, consumer, candles, aggregator, log); err != nil {
+		if err := consumeOnce(ctx, consumer, sink, aggregator); err != nil {
 			if ctx.Err() != nil || errors.Is(err, kafka.ErrConsumerClosed) {
 				return nil
 			}
@@ -160,7 +180,7 @@ func consume(ctx context.Context, consumer *kafka.Consumer, candles *postgres.Ca
 
 // consumeOnce обрабатывает один батч: читает, наполняет окна, закрывает
 // созревшие, отдаёт свечи и коммитит оффсеты.
-func consumeOnce(ctx context.Context, consumer *kafka.Consumer, candles *postgres.CandleStore, aggregator *aggregate.Aggregator, log *slog.Logger) error {
+func consumeOnce(ctx context.Context, consumer *kafka.Consumer, sink *candleSink, aggregator *aggregate.Aggregator) error {
 	// Release снимает блокировку ребалансировки, поставленную Poll, при
 	// любом исходе обработки батча.
 	defer consumer.Release()
@@ -176,11 +196,9 @@ func consumeOnce(ctx context.Context, consumer *kafka.Consumer, candles *postgre
 
 	// Проверка дедлайнов идёт всегда, даже если батч пустой: по редкому
 	// инструменту окно должно закрыться и без новых сделок.
-	closed := aggregator.Expired(time.Now())
-	if err := store(ctx, candles, closed, log); err != nil {
+	if err := sink.write(ctx, aggregator.Expired(time.Now())); err != nil {
 		return err
 	}
-	emitCandles(log, closed)
 
 	// Пустой батч коммитить незачем — оффсеты не сдвинулись.
 	if len(trades) == 0 {
@@ -196,21 +214,48 @@ func consumeOnce(ctx context.Context, consumer *kafka.Consumer, candles *postgre
 	return nil
 }
 
-// store записывает свечи, повторяя попытку при сбое базы.
+// candleSink принимает закрытые свечи: пишет их в базу, публикует в Kafka
+// и выводит в лог.
 //
-// Оффсеты не коммитятся, пока запись не удалась, поэтому исчерпание попыток
-// означает остановку сервиса: потерянные свечи будут пересчитаны при
-// следующем запуске из того же батча.
-func store(ctx context.Context, candles *postgres.CandleStore, closed []domain.Candle, log *slog.Logger) error {
+// Порядок операций важен и зафиксирован здесь, а не размазан по вызывающему
+// коду. База — источник истины, запись в неё блокирующая и с повторами.
+// Топик вторичен: публикация асинхронная, её сбой не останавливает конвейер,
+// потому что свеча уже сохранена и потребитель топика может перечитать её
+// из базы.
+type candleSink struct {
+	store    *postgres.CandleStore
+	producer *kafka.Producer
+	log      *slog.Logger
+}
+
+func (s *candleSink) write(ctx context.Context, closed []domain.Candle) error {
 	if len(closed) == 0 {
 		return nil
 	}
 
+	if err := s.persist(ctx, closed); err != nil {
+		return err
+	}
+
+	for _, candle := range closed {
+		s.producer.PublishCandle(ctx, candle)
+	}
+
+	emitCandles(s.log, closed)
+	return nil
+}
+
+// persist записывает свечи в базу, повторяя попытку при сбое.
+//
+// Оффсеты не коммитятся, пока запись не удалась, поэтому исчерпание попыток
+// означает остановку сервиса: потерянные свечи будут пересчитаны при
+// следующем запуске из того же батча.
+func (s *candleSink) persist(ctx context.Context, closed []domain.Candle) error {
 	delay := dbWriteInitialDelay
 	var lastErr error
 
 	for attempt := 1; attempt <= dbWriteAttempts; attempt++ {
-		lastErr = candles.Upsert(ctx, closed)
+		lastErr = s.store.Upsert(ctx, closed)
 		if lastErr == nil {
 			return nil
 		}
@@ -219,7 +264,7 @@ func store(ctx context.Context, candles *postgres.CandleStore, closed []domain.C
 			return lastErr
 		}
 
-		log.Error("failed to write candles",
+		s.log.Error("failed to write candles",
 			slog.Int("candles", len(closed)),
 			slog.Int("attempt", attempt),
 			slog.Int("attempts", dbWriteAttempts),

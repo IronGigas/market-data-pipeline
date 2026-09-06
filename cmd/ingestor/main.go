@@ -93,7 +93,7 @@ func run(cfg config.Ingestor, log *slog.Logger) error {
 			// Контекст сервиса здесь не годится: он отменяется первым, а
 			// хвост буфера нужно успеть отправить. Ограничение времени
 			// берёт на себя Flush внутри Close.
-			producer.Publish(context.WithoutCancel(ctx), trade)
+			producer.PublishTrade(context.WithoutCancel(ctx), trade)
 		}
 	}()
 

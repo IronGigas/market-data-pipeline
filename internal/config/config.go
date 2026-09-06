@@ -109,6 +109,7 @@ type Aggregator struct {
 
 	KafkaBrokers  []string
 	TopicTrades   string
+	TopicCandles  string
 	ConsumerGroup string
 
 	// PostgresDSN — строка подключения к базе, куда пишутся свечи.
@@ -148,6 +149,15 @@ func LoadAggregator() (Aggregator, error) {
 		return Aggregator{}, fmt.Errorf("%w: MDP_TOPIC_TRADES: %w", ErrInvalidConfig, err)
 	}
 
+	topicCandles, err := parseTopic(env("MDP_TOPIC_CANDLES", "md.candles"))
+	if err != nil {
+		return Aggregator{}, fmt.Errorf("%w: MDP_TOPIC_CANDLES: %w", ErrInvalidConfig, err)
+	}
+	if topicCandles == topicTrades {
+		return Aggregator{}, fmt.Errorf("%w: MDP_TOPIC_CANDLES and MDP_TOPIC_TRADES must differ (both are %q)",
+			ErrInvalidConfig, topicCandles)
+	}
+
 	group := strings.TrimSpace(env("MDP_CONSUMER_GROUP", "md-aggregator"))
 	if group == "" {
 		return Aggregator{}, fmt.Errorf("%w: MDP_CONSUMER_GROUP is empty", ErrInvalidConfig)
@@ -173,6 +183,7 @@ func LoadAggregator() (Aggregator, error) {
 		Timeframes:    timeframes,
 		KafkaBrokers:  brokers,
 		TopicTrades:   topicTrades,
+		TopicCandles:  topicCandles,
 		ConsumerGroup: group,
 		PostgresDSN:   dsn,
 		Grace:         grace,
