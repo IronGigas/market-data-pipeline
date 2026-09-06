@@ -111,6 +111,9 @@ type Aggregator struct {
 	TopicTrades   string
 	ConsumerGroup string
 
+	// PostgresDSN — строка подключения к базе, куда пишутся свечи.
+	PostgresDSN string
+
 	// Grace — сколько ждать опоздавшие сделки после границы окна.
 	Grace time.Duration
 
@@ -150,6 +153,12 @@ func LoadAggregator() (Aggregator, error) {
 		return Aggregator{}, fmt.Errorf("%w: MDP_CONSUMER_GROUP is empty", ErrInvalidConfig)
 	}
 
+	dsn := strings.TrimSpace(env("MDP_POSTGRES_DSN",
+		"postgres://marketdata:marketdata@localhost:5432/marketdata?sslmode=disable"))
+	if dsn == "" {
+		return Aggregator{}, fmt.Errorf("%w: MDP_POSTGRES_DSN is empty", ErrInvalidConfig)
+	}
+
 	grace, err := parseDuration(env("MDP_GRACE_PERIOD", "2s"))
 	if err != nil {
 		return Aggregator{}, fmt.Errorf("%w: MDP_GRACE_PERIOD: %w", ErrInvalidConfig, err)
@@ -165,6 +174,7 @@ func LoadAggregator() (Aggregator, error) {
 		KafkaBrokers:  brokers,
 		TopicTrades:   topicTrades,
 		ConsumerGroup: group,
+		PostgresDSN:   dsn,
 		Grace:         grace,
 		IdleTimeout:   idleTimeout,
 		LogLevel:      level,

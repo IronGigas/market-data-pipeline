@@ -1,14 +1,13 @@
 // Команда aggregator читает сделки из Kafka, собирает их в OHLCV-свечи и
-// выводит закрытые свечи в stdout.
+// сохраняет закрытые свечи в PostgreSQL.
 //
-// Запись в PostgreSQL и публикация в md.candles появятся следующими этапами;
-// сейчас сервис доказывает, что окна закрываются вовремя и на реальном
-// потоке получаются осмысленные свечи.
+// Публикация свечей в md.candles появится следующим этапом.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -19,6 +18,7 @@ import (
 	"github.com/IronGigas/market-data-pipeline/internal/broker/kafka"
 	"github.com/IronGigas/market-data-pipeline/internal/config"
 	"github.com/IronGigas/market-data-pipeline/internal/domain"
+	"github.com/IronGigas/market-data-pipeline/internal/storage/postgres"
 )
 
 // pollTimeout — сколько ждать новых записей за один опрос Kafka.
@@ -28,6 +28,21 @@ import (
 // отдельная горутина-тикер не нужна — окно замолчавшего инструмента
 // закроется не позже, чем через 250 мс после своего дедлайна.
 const pollTimeout = 250 * time.Millisecond
+
+// Повторы записи в базу.
+//
+// Три попытки с растущей паузой покрывают короткий сбой сети или
+// перезапуск базы. Если и они не помогли, процесс падает: продолжать
+// потребление, теряя свечи, хуже, чем остановиться — оффсеты не
+// закоммичены, и после перезапуска батч будет обработан заново.
+const (
+	dbWriteAttempts     = 3
+	dbWriteInitialDelay = 200 * time.Millisecond
+)
+
+// flushTimeout ограничивает запись частичных свечей при остановке: висеть
+// на недоступной базе, когда пользователь уже нажал Ctrl+C, нельзя.
+const flushTimeout = 5 * time.Second
 
 func main() {
 	cfg, err := config.LoadAggregator()
@@ -47,6 +62,19 @@ func main() {
 func run(cfg config.Aggregator, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// База открывается первой: без неё сервис бессмыслен, и незачем
+	// вступать в consumer-группу, чтобы тут же из неё выйти.
+	db, err := postgres.New(ctx, postgres.Config{
+		DSN:    cfg.PostgresDSN,
+		Logger: log,
+	})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	candles := postgres.NewCandleStore(db)
 
 	consumer, err := kafka.NewConsumer(ctx, kafka.ConsumerConfig{
 		Brokers: cfg.KafkaBrokers,
@@ -78,13 +106,22 @@ func run(cfg config.Aggregator, log *slog.Logger) error {
 		slog.Duration("idle_timeout", cfg.IdleTimeout),
 		slog.String("log_level", cfg.LogLevel.String()))
 
-	loopErr := consume(ctx, consumer, aggregator, log)
+	loopErr := consume(ctx, consumer, candles, aggregator, log)
 
 	// Остановка: открытые окна дописываются как частичные свечи, иначе
 	// накопленные сделки последнего интервала пропали бы бесследно.
 	if partial := aggregator.Flush(); len(partial) > 0 {
 		log.Info("flushing open windows", slog.Int("candles", len(partial)))
-		emitCandles(log, partial)
+
+		// Контекст сервиса уже отменён сигналом, поэтому для последней
+		// записи берётся свежий с собственным таймаутом.
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
+		if err := store(flushCtx, candles, partial, log); err != nil {
+			log.Error("failed to persist partial candles", slog.String("error", err.Error()))
+		} else {
+			emitCandles(log, partial)
+		}
+		cancel()
 	}
 
 	stats := aggregator.Stats()
@@ -106,13 +143,13 @@ func run(cfg config.Aggregator, log *slog.Logger) error {
 // и обработка батча: опрос Kafka сам возвращается по таймауту, и отдельная
 // горутина-тикер только добавила бы гонку между свечами, закрытыми тикером,
 // и коммитом оффсетов батча.
-func consume(ctx context.Context, consumer *kafka.Consumer, aggregator *aggregate.Aggregator, log *slog.Logger) error {
+func consume(ctx context.Context, consumer *kafka.Consumer, candles *postgres.CandleStore, aggregator *aggregate.Aggregator, log *slog.Logger) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		if err := consumeOnce(ctx, consumer, aggregator, log); err != nil {
+		if err := consumeOnce(ctx, consumer, candles, aggregator, log); err != nil {
 			if ctx.Err() != nil || errors.Is(err, kafka.ErrConsumerClosed) {
 				return nil
 			}
@@ -123,7 +160,7 @@ func consume(ctx context.Context, consumer *kafka.Consumer, aggregator *aggregat
 
 // consumeOnce обрабатывает один батч: читает, наполняет окна, закрывает
 // созревшие, отдаёт свечи и коммитит оффсеты.
-func consumeOnce(ctx context.Context, consumer *kafka.Consumer, aggregator *aggregate.Aggregator, log *slog.Logger) error {
+func consumeOnce(ctx context.Context, consumer *kafka.Consumer, candles *postgres.CandleStore, aggregator *aggregate.Aggregator, log *slog.Logger) error {
 	// Release снимает блокировку ребалансировки, поставленную Poll, при
 	// любом исходе обработки батча.
 	defer consumer.Release()
@@ -139,19 +176,68 @@ func consumeOnce(ctx context.Context, consumer *kafka.Consumer, aggregator *aggr
 
 	// Проверка дедлайнов идёт всегда, даже если батч пустой: по редкому
 	// инструменту окно должно закрыться и без новых сделок.
-	emitCandles(log, aggregator.Expired(time.Now()))
+	closed := aggregator.Expired(time.Now())
+	if err := store(ctx, candles, closed, log); err != nil {
+		return err
+	}
+	emitCandles(log, closed)
 
 	// Пустой батч коммитить незачем — оффсеты не сдвинулись.
 	if len(trades) == 0 {
 		return nil
 	}
 
-	// Коммит последним: до этого момента аварийная остановка приведёт лишь
-	// к повторной обработке батча, а она безопасна.
+	// Коммит последним, уже после успешной записи свечей: до этого момента
+	// аварийная остановка приведёт лишь к повторной обработке батча,
+	// а она безопасна благодаря идемпотентному upsert.
 	if err := consumer.Commit(ctx); err != nil {
 		return err
 	}
 	return nil
+}
+
+// store записывает свечи, повторяя попытку при сбое базы.
+//
+// Оффсеты не коммитятся, пока запись не удалась, поэтому исчерпание попыток
+// означает остановку сервиса: потерянные свечи будут пересчитаны при
+// следующем запуске из того же батча.
+func store(ctx context.Context, candles *postgres.CandleStore, closed []domain.Candle, log *slog.Logger) error {
+	if len(closed) == 0 {
+		return nil
+	}
+
+	delay := dbWriteInitialDelay
+	var lastErr error
+
+	for attempt := 1; attempt <= dbWriteAttempts; attempt++ {
+		lastErr = candles.Upsert(ctx, closed)
+		if lastErr == nil {
+			return nil
+		}
+		// Отмена контекста — это остановка сервиса, а не сбой базы.
+		if ctx.Err() != nil {
+			return lastErr
+		}
+
+		log.Error("failed to write candles",
+			slog.Int("candles", len(closed)),
+			slog.Int("attempt", attempt),
+			slog.Int("attempts", dbWriteAttempts),
+			slog.String("error", lastErr.Error()))
+
+		if attempt == dbWriteAttempts {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+
+	return fmt.Errorf("write candles after %d attempts: %w", dbWriteAttempts, lastErr)
 }
 
 // emitCandles выводит закрытые свечи.
